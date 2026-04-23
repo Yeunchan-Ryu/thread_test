@@ -19,7 +19,9 @@ typedef struct {
 DeviceState currentState;
 char sharedCmdBuffer[256];
 double pendingValue = 0.0;
+int pendingMode = 0;
 
+HANDLE hUIEvent;
 HANDLE hSendEvent;
 HANDLE hRecvEvent;
 CRITICAL_SECTION cs;
@@ -43,7 +45,7 @@ DWORD WINAPI SendThread(LPVOID IpParm) {
 
         QueryPerformanceCounter(&end);
         double latency = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-        printf("Send Latency : %.3f ms\n", latency);
+        printf("\nSend Latency : %.3f ms\n", latency);
 
         SetEvent(hRecvEvent);
     }
@@ -66,19 +68,30 @@ DWORD WINAPI RecvThread(LPVOID IpParam) {
             
             EnterCriticalSection(&cs);
             if (resultValue == pendingValue) {
-                currentState.freq = resultValue;
-                printf("\n >> Success! Frequency updated to %.2f Hz\n", resultValue);
+                if (pendingMode == 1) {
+                    currentState.freq = resultValue;
+                    printf(">> Change Frequency to %.2f Hz.\n", resultValue);
+                }
+                else if (pendingMode == 2) {
+                    currentState.amp = resultValue;
+                    printf(">> Change Amplitude to %.2f Vpp.\n", resultValue);
+                }
+                else if (pendingMode == 3) {
+                    currentState.phase = resultValue;
+                    printf(">> Change Phase to %.2f Degree.\n", resultValue);
+                }
             }
             else {
                 printf("\n Error! Value Mismatch.\n");
             }
             LeaveCriticalSection(&cs);
         }
+        QueryPerformanceCounter(&end);
+        double latency = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+        printf("Receive Latency : %.3f ms\n", latency);
+        SetEvent(hUIEvent);
     }
-    QueryPerformanceCounter(&end);
-    double latency = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-    printf("Send Latency : %.3f ms\n", latency);
-
+    return 0;
 }
 
 
@@ -86,30 +99,28 @@ void InitDeviceState() {
     char InitBuffer[256];
     int n;
     printf("Initialize Start.\n");
-    const char* cmd = "FREQ?";
-    send(instrument_sock, cmd, strlen(cmd), 0);
+    
+    WaitForSingleObject(hUIEvent, INFINITE);
+    send(instrument_sock, "FREQ?\n", 6, 0);
     n = recv(instrument_sock, InitBuffer, sizeof(InitBuffer) - 1, 0);
     if (n > 0) {
         InitBuffer[n] = '\0';
         currentState.freq = atof(InitBuffer);
     }
-    /*
-    const char* cmd1 = "VOLT?";
-    send(instrument_sock, cmd1, strlen(cmd1), 0);
+    
+    send(instrument_sock, "VOLT?\n", 6, 0);
     n = recv(instrument_sock, InitBuffer, sizeof(InitBuffer) - 1, 0);
     if (n > 0) {
-        InitBuffer[n] = '/0';
+        InitBuffer[n] = '\0';
         currentState.amp = atof(InitBuffer);
     }
 
-    const char* cmd2 = "PHAS?";
-    send(instrument_sock, cmd2, strlen(cmd2), 0);
+    send(instrument_sock, "PHAS?\n", 6, 0);
     n = recv(instrument_sock, InitBuffer, sizeof(InitBuffer) - 1, 0);
     if (n > 0) {
-        InitBuffer[n] = '/0';
+        InitBuffer[n] = '\0';
         currentState.phase = atof(InitBuffer);
     }
-    */
     
     printf("Initialize Complete! \n");
 }
@@ -151,17 +162,18 @@ int main(void)
     InitializeCriticalSection(&cs);
     hSendEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     hRecvEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-
+    hUIEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
     InitDeviceState();
 
     HANDLE hSendTh = CreateThread(NULL, 0, SendThread, NULL, 0, NULL);
     HANDLE hRecvTh = CreateThread(NULL, 0, RecvThread, NULL, 0, NULL);
 
     while (running) {
+        if (!running) break;
         printf("\n[ Current Device Status]\n");
         printf("Frequency : %.2f Hz\n", currentState.freq);
-        printf("Amplitude : %.2f Hz\n", currentState.amp);
-        printf("Phase : %.2f Hz\n", currentState.phase);
+        printf("Amplitude : %.2f Vpp\n", currentState.amp);
+        printf("Phase : %.2f Degree\n", currentState.phase);
         printf("Which one to Change? (Enter only number)\n");
         printf("(1. Freq / 2. Amp / 3. Phase / 4. Exit / 5. Reset(Initalize)) : ");
 
@@ -179,42 +191,50 @@ int main(void)
 
             EnterCriticalSection(&cs);
             pendingValue = newValue;
+            pendingMode = 1;
             snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "FREQ %f\nFREQ?\n", newValue);
             LeaveCriticalSection(&cs);
 
             SetEvent(hSendEvent);
+            printf("Changing and Responding of Frequency. Please wait...\n");
             break;
 
         case 2:
-            printf("Change Amplitude Value (Hz) : ");
+            printf("Change Amplitude Value (Vpp) : ");
             scanf("%lf", &newValue);
 
             EnterCriticalSection(&cs);
+            pendingMode = 2;
             pendingValue = newValue;
             snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "VOLT %f\nVOLT?\n", newValue);
             LeaveCriticalSection(&cs);
 
             SetEvent(hSendEvent);
+            printf("Changing and Responding of Amplitude. Please wait...\n");
             break;
 
         case 3:
-            printf("Change Frequency Value (Hz) : ");
+            printf("Change Frequency Value (Degree) : ");
             scanf("%lf", &newValue);
 
             EnterCriticalSection(&cs);
+            pendingMode = 3;
             pendingValue = newValue;
-            snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "FREQ %f\nFREQ?\n", newValue);
+            snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "PHAS %f\nPHAS?\n", newValue);
             LeaveCriticalSection(&cs);
 
             SetEvent(hSendEvent);
+            printf("Changing and Responding of Phase. Please wait...\n");
             break;
 
         case 4:
             running = false;
-            printf("Exiting the Programming");
+            printf("Exiting the Programming...\n");
+            SetEvent(hUIEvent);
             break;
 
         case 5:
+            SetEvent(hUIEvent);
             InitDeviceState();
             break;
 
@@ -222,7 +242,8 @@ int main(void)
             printf("Wrong Input. Enter a number between 1~4. \n");
             break;
         }
-
+        //Sleep(1000);
+        WaitForSingleObject(hUIEvent, INFINITE);
     }
 
     closesocket(instrument_sock);
