@@ -1,0 +1,233 @@
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#pragma comment(lib, "Ws2_32.lib")
+
+SOCKET instrument_sock = INVALID_SOCKET;
+
+typedef struct {
+    double freq;
+    double amp;
+    double phase;
+}DeviceState;
+
+DeviceState currentState;
+char sharedCmdBuffer[256];
+double pendingValue = 0.0;
+
+HANDLE hSendEvent;
+HANDLE hRecvEvent;
+CRITICAL_SECTION cs;
+
+void clearInputBuffer() {
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF);
+}
+
+DWORD WINAPI SendThread(LPVOID IpParm) {
+    while (true) {
+        LARGE_INTEGER start, end, freq;
+
+        WaitForSingleObject(hSendEvent, INFINITE);
+        QueryPerformanceCounter(&start);
+        QueryPerformanceFrequency(&freq);
+
+        EnterCriticalSection(&cs);
+        send(instrument_sock, sharedCmdBuffer, strlen(sharedCmdBuffer), 0);
+        LeaveCriticalSection(&cs);
+
+        QueryPerformanceCounter(&end);
+        double latency = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+        printf("Send Latency : %.3f ms\n", latency);
+
+        SetEvent(hRecvEvent);
+    }
+    return 0;
+}
+
+DWORD WINAPI RecvThread(LPVOID IpParam) {
+    char recvBuffer[256];
+    LARGE_INTEGER start, end, freq;
+
+    QueryPerformanceCounter(&start);
+    QueryPerformanceCounter(&freq);
+
+    while (true) {
+        WaitForSingleObject(hRecvEvent, INFINITE);
+        int n = recv(instrument_sock, recvBuffer, sizeof(recvBuffer) - 1, 0);
+        if (n > 0) {
+            recvBuffer[n] = '\0';
+            double resultValue = atof(recvBuffer);
+            
+            EnterCriticalSection(&cs);
+            if (resultValue == pendingValue) {
+                currentState.freq = resultValue;
+                printf("\n >> Success! Frequency updated to %.2f Hz\n", resultValue);
+            }
+            else {
+                printf("\n Error! Value Mismatch.\n");
+            }
+            LeaveCriticalSection(&cs);
+        }
+    }
+    QueryPerformanceCounter(&end);
+    double latency = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+    printf("Send Latency : %.3f ms\n", latency);
+
+}
+
+
+void InitDeviceState() {
+    char InitBuffer[256];
+    int n;
+    printf("Initialize Start.\n");
+    const char* cmd = "FREQ?";
+    send(instrument_sock, cmd, strlen(cmd), 0);
+    n = recv(instrument_sock, InitBuffer, sizeof(InitBuffer) - 1, 0);
+    if (n > 0) {
+        InitBuffer[n] = '\0';
+        currentState.freq = atof(InitBuffer);
+    }
+    /*
+    const char* cmd1 = "VOLT?";
+    send(instrument_sock, cmd1, strlen(cmd1), 0);
+    n = recv(instrument_sock, InitBuffer, sizeof(InitBuffer) - 1, 0);
+    if (n > 0) {
+        InitBuffer[n] = '/0';
+        currentState.amp = atof(InitBuffer);
+    }
+
+    const char* cmd2 = "PHAS?";
+    send(instrument_sock, cmd2, strlen(cmd2), 0);
+    n = recv(instrument_sock, InitBuffer, sizeof(InitBuffer) - 1, 0);
+    if (n > 0) {
+        InitBuffer[n] = '/0';
+        currentState.phase = atof(InitBuffer);
+    }
+    */
+    
+    printf("Initialize Complete! \n");
+}
+
+int main(void)
+{
+    WSADATA wsaData;
+    struct sockaddr_in server;
+    const char* ip = "169.254.5.10";
+    int port = 5025;
+    bool running = true;
+    double newValue;
+
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    instrument_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (instrument_sock == INVALID_SOCKET) {
+        printf("ERROR : Failed Socket Creation,\n");
+        WSACleanup();
+        return -1;
+    }
+
+    memset(&server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
+    InetPtonA(AF_INET, ip, &server.sin_addr);
+
+    printf("Connecting to device...\n");
+    if (connect(instrument_sock, (struct sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) {
+        printf("ERROR : Can't Connect with Device.\n");
+        closesocket(instrument_sock);
+        WSACleanup();
+        return -1;
+    }
+    printf("Connected Successful. System start. Please Wait...\n");
+    Sleep(1000);
+
+
+    InitializeCriticalSection(&cs);
+    hSendEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    hRecvEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+    InitDeviceState();
+
+    HANDLE hSendTh = CreateThread(NULL, 0, SendThread, NULL, 0, NULL);
+    HANDLE hRecvTh = CreateThread(NULL, 0, RecvThread, NULL, 0, NULL);
+
+    while (running) {
+        printf("\n[ Current Device Status]\n");
+        printf("Frequency : %.2f Hz\n", currentState.freq);
+        printf("Amplitude : %.2f Hz\n", currentState.amp);
+        printf("Phase : %.2f Hz\n", currentState.phase);
+        printf("Which one to Change? (Enter only number)\n");
+        printf("(1. Freq / 2. Amp / 3. Phase / 4. Exit / 5. Reset(Initalize)) : ");
+
+        int choice;
+        if (scanf("%d", &choice) != 1) {
+            printf("Invalid input. Please enter a number.\n");
+            clearInputBuffer();
+            continue;
+        }
+
+        switch (choice) {
+        case 1:
+            printf("Change Frequency Value (Hz) : ");
+            scanf("%lf", &newValue);
+
+            EnterCriticalSection(&cs);
+            pendingValue = newValue;
+            snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "FREQ %f\nFREQ?\n", newValue);
+            LeaveCriticalSection(&cs);
+
+            SetEvent(hSendEvent);
+            break;
+
+        case 2:
+            printf("Change Amplitude Value (Hz) : ");
+            scanf("%lf", &newValue);
+
+            EnterCriticalSection(&cs);
+            pendingValue = newValue;
+            snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "VOLT %f\nVOLT?\n", newValue);
+            LeaveCriticalSection(&cs);
+
+            SetEvent(hSendEvent);
+            break;
+
+        case 3:
+            printf("Change Frequency Value (Hz) : ");
+            scanf("%lf", &newValue);
+
+            EnterCriticalSection(&cs);
+            pendingValue = newValue;
+            snprintf(sharedCmdBuffer, sizeof(sharedCmdBuffer), "FREQ %f\nFREQ?\n", newValue);
+            LeaveCriticalSection(&cs);
+
+            SetEvent(hSendEvent);
+            break;
+
+        case 4:
+            running = false;
+            printf("Exiting the Programming");
+            break;
+
+        case 5:
+            InitDeviceState();
+            break;
+
+        default:
+            printf("Wrong Input. Enter a number between 1~4. \n");
+            break;
+        }
+
+    }
+
+    closesocket(instrument_sock);
+    WSACleanup();
+    printf("System successfully closed.\n");
+
+    return 0;
+}
